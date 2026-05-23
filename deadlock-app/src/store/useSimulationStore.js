@@ -1,5 +1,12 @@
 import { create } from 'zustand';
 import { playAlarm, playSuccess } from '../utils/audio';
+import {
+  computeHoldAndWaitAllAtOnce,
+  computeHoldAndWaitReleaseFirst,
+  computeForceRelease,
+  computePreemptFromBlocked,
+  computeCircularWaitCheck
+} from '../utils/preventionEngine';
 
 // ─── Textbook Presets ───────────────────────────────────────────────────────
 export const TEXTBOOK_PRESETS = {
@@ -458,6 +465,191 @@ const useSimulationStore = create((set, get) => {
           ...s.starvationCounters,
           [target]: (s.starvationCounters[target] || 0) + 1
         }
+      }));
+    },
+
+    // ── Prevention Protocol Execution ────────────────────────────────────────
+
+    /**
+     * Protocol 1: Hold and Wait — Request All At Once
+     * Returns the computed result with steps for animation.
+     */
+    executeHoldAndWaitAllAtOnce: (processId, requestedResourceIds) => {
+      const s = get();
+      const result = computeHoldAndWaitAllAtOnce(s.processes, s.resources, s.edges, processId, requestedResourceIds);
+
+      if (result.canAllocate) {
+        const newEdges = requestedResourceIds.map(rId => ({ source: rId, target: processId, type: 'assignment' }));
+        set({ edges: [...s.edges, ...newEdges] });
+        logEvent(`PREVENTION [Hold&Wait P1]: ${processId} allocated all: ${requestedResourceIds.join(', ')}`, 'info');
+        addTimelineEntry(`${processId} granted all resources atomically (Hold & Wait P1)`, 'prevention');
+        playSuccess();
+      } else {
+        set({
+          processes: s.processes.map(p => p.id === processId ? { ...p, state: 'waiting' } : p)
+        });
+        logEvent(`PREVENTION [Hold&Wait P1]: ${processId} denied — not all resources available`, 'error');
+        addTimelineEntry(`${processId} request denied — partial allocation prevented (Hold & Wait P1)`, 'prevention');
+        playAlarm();
+      }
+      setTimeout(updateProcessStates, 50);
+      return result;
+    },
+
+    /**
+     * Protocol 2: Hold and Wait — Request Only When Holding None
+     * Returns the computed result with steps for animation.
+     */
+    executeHoldAndWaitReleaseFirst: (processId, newRequestedIds) => {
+      const s = get();
+      const result = computeHoldAndWaitReleaseFirst(s.processes, s.resources, s.edges, processId, newRequestedIds);
+
+      if (result.mustRelease) {
+        const remainingEdges = s.edges.filter(e => !(e.type === 'assignment' && e.target === processId));
+        const releasedResources = [...new Set(s.edges.filter(e => e.type === 'assignment' && e.target === processId).map(e => e.source))];
+        logEvent(`PREVENTION [Hold&Wait P2]: ${processId} releasing all held: ${releasedResources.join(', ')}`, 'warning');
+        addTimelineEntry(`${processId} released all resources: ${releasedResources.join(', ')} (Hold & Wait P2)`, 'prevention');
+
+        const allNeeded = result.allNeeded;
+        if (result.allAvailable) {
+          const newEdges = allNeeded.map(rId => ({ source: rId, target: processId, type: 'assignment' }));
+          set({ edges: [...remainingEdges, ...newEdges] });
+          logEvent(`PREVENTION [Hold&Wait P2]: ${processId} re-allocated all: ${allNeeded.join(', ')}`, 'info');
+          addTimelineEntry(`${processId} re-granted all resources after release (Hold & Wait P2)`, 'prevention');
+          playSuccess();
+        } else {
+          set({
+            edges: remainingEdges,
+            processes: s.processes.map(p => p.id === processId ? { ...p, state: 'waiting' } : p)
+          });
+          logEvent(`PREVENTION [Hold&Wait P2]: ${processId} released but cannot get all needed — WAITING`, 'error');
+          addTimelineEntry(`${processId} released resources, re-request denied — WAITING (Hold & Wait P2)`, 'prevention');
+          playAlarm();
+        }
+      } else {
+        if (result.allAvailable) {
+          const newEdges = newRequestedIds.map(rId => ({ source: rId, target: processId, type: 'assignment' }));
+          set({ edges: [...s.edges, ...newEdges] });
+          logEvent(`PREVENTION [Hold&Wait P2]: ${processId} holds nothing, allocated: ${newRequestedIds.join(', ')}`, 'info');
+          addTimelineEntry(`${processId} allocated resources (held nothing) (Hold & Wait P2)`, 'prevention');
+          playSuccess();
+        } else {
+          set({
+            processes: s.processes.map(p => p.id === processId ? { ...p, state: 'waiting' } : p)
+          });
+          logEvent(`PREVENTION [Hold&Wait P2]: ${processId} denied — resources unavailable`, 'error');
+          addTimelineEntry(`${processId} request denied (Hold & Wait P2)`, 'prevention');
+          playAlarm();
+        }
+      }
+      setTimeout(updateProcessStates, 50);
+      return result;
+    },
+
+    /**
+     * Protocol 3: No Preemption — Force Resource Release
+     * Returns the computed result with steps for animation.
+     */
+    executeNoPreemptionForceRelease: (processId, requestedResourceId) => {
+      const s = get();
+      const result = computeForceRelease(s.processes, s.resources, s.edges, processId, requestedResourceId);
+
+      if (result.resourceAvailable) {
+        set({ edges: [...s.edges, { source: requestedResourceId, target: processId, type: 'assignment' }] });
+        logEvent(`PREVENTION [NoPreemp P3]: ${requestedResourceId} allocated to ${processId}`, 'info');
+        addTimelineEntry(`${requestedResourceId} allocated to ${processId} (No Preemption P3)`, 'prevention');
+        playSuccess();
+      } else if (result.preempted) {
+        const remainingEdges = s.edges.filter(e => !(e.type === 'assignment' && e.target === processId));
+        set({
+          edges: remainingEdges,
+          processes: s.processes.map(p => p.id === processId ? { ...p, state: 'waiting' } : p)
+        });
+        logEvent(`PREVENTION [NoPreemp P3]: Forcibly preempted all from ${processId}: ${result.heldResourceIds.join(', ')}`, 'warning');
+        addTimelineEntry(`${processId} forcibly preempted — all resources released (No Preemption P3)`, 'prevention');
+        playAlarm();
+      } else {
+        set({
+          processes: s.processes.map(p => p.id === processId ? { ...p, state: 'waiting' } : p)
+        });
+        logEvent(`PREVENTION [NoPreemp P3]: ${processId} must wait for ${requestedResourceId}`, 'info');
+        addTimelineEntry(`${processId} waiting for ${requestedResourceId} (No Preemption P3)`, 'prevention');
+      }
+      setTimeout(updateProcessStates, 50);
+      return result;
+    },
+
+    /**
+     * Protocol 4: No Preemption — Preempt From Blocked Process
+     * Returns the computed result with steps for animation.
+     */
+    executeNoPreemptionFromBlocked: (requestingProcessId, resourceId) => {
+      const s = get();
+      const result = computePreemptFromBlocked(s.processes, s.resources, s.edges, requestingProcessId, resourceId);
+
+      if (result.resourceAvailable) {
+        set({ edges: [...s.edges, { source: resourceId, target: requestingProcessId, type: 'assignment' }] });
+        logEvent(`PREVENTION [NoPreemp P4]: ${resourceId} available — allocated to ${requestingProcessId}`, 'info');
+        addTimelineEntry(`${resourceId} allocated to ${requestingProcessId} (No Preemption P4)`, 'prevention');
+        playSuccess();
+      } else if (result.transferred && result.victim && result.victimEdge) {
+        const newEdges = s.edges.filter(e => e !== result.victimEdge);
+        newEdges.push({ source: resourceId, target: requestingProcessId, type: 'assignment' });
+        set({ edges: newEdges });
+        logEvent(`PREVENTION [NoPreemp P4]: ${resourceId} preempted from ${result.victim} → ${requestingProcessId}`, 'warning');
+        addTimelineEntry(`${resourceId} preempted: ${result.victim} → ${requestingProcessId} (No Preemption P4)`, 'prevention');
+        playSuccess();
+      } else {
+        set({
+          processes: s.processes.map(p => p.id === requestingProcessId ? { ...p, state: 'waiting' } : p)
+        });
+        logEvent(`PREVENTION [NoPreemp P4]: No blocked holder for ${resourceId} — ${requestingProcessId} must wait`, 'info');
+        addTimelineEntry(`${requestingProcessId} waiting — no preemptable holder (No Preemption P4)`, 'prevention');
+      }
+      setTimeout(updateProcessStates, 50);
+      return result;
+    },
+
+    /**
+     * Protocol 5: Circular Wait — Resource Ordering
+     * Returns the computed result with steps for animation.
+     */
+    executeCircularWaitOrdering: (processId, resourceId) => {
+      const s = get();
+      const result = computeCircularWaitCheck(s.processes, s.resources, s.edges, processId, resourceId);
+
+      if (result.allowed) {
+        const resource = s.resources.find(r => r.id === resourceId);
+        const currentAllocated = s.edges.filter(e => e.type === 'assignment' && e.source === resourceId).length;
+        const available = resource ? resource.instances - currentAllocated : 0;
+
+        if (available > 0) {
+          set({ edges: [...s.edges, { source: resourceId, target: processId, type: 'assignment' }] });
+          logEvent(`PREVENTION [CircWait]: ${processId} allocated ${resourceId} (order: ${result.requestedOrder} > max held: ${result.maxHeldOrder})`, 'info');
+          addTimelineEntry(`${resourceId} allocated to ${processId} — ordering maintained (Circular Wait)`, 'prevention');
+          playSuccess();
+        } else {
+          set({
+            processes: s.processes.map(p => p.id === processId ? { ...p, state: 'waiting' } : p)
+          });
+          logEvent(`PREVENTION [CircWait]: Ordering OK but ${resourceId} depleted — ${processId} waiting`, 'info');
+          addTimelineEntry(`${processId} waiting — ${resourceId} depleted (Circular Wait)`, 'prevention');
+        }
+      } else {
+        logEvent(`PREVENTION [CircWait]: ${processId} DENIED ${resourceId} (order ${result.requestedOrder} ≤ max held ${result.maxHeldOrder})`, 'error');
+        addTimelineEntry(`${processId} denied ${resourceId} — violates resource ordering (Circular Wait)`, 'prevention');
+        playAlarm();
+      }
+      setTimeout(updateProcessStates, 50);
+      return result;
+    },
+
+    /**
+     * Utility: Directly set a process state (for protocol demos)
+     */
+    setProcessState: (processId, state) => {
+      set((s) => ({
+        processes: s.processes.map(p => p.id === processId ? { ...p, state } : p)
       }));
     },
 
