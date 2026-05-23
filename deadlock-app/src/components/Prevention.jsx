@@ -1,99 +1,325 @@
-import React, { useState } from 'react';
-import { Shield, Lock, Activity, Ban, CheckCircle, Play, Cpu, AlertTriangle } from 'lucide-react';
-import useSimulationStore from '../store/useSimulationStore';
+import React, { useState, useCallback, useMemo } from 'react';
+import { Shield, Play, RotateCcw, Lock, Unlock, ChevronRight, ChevronLeft, Zap, ArrowRight, CheckCircle, XCircle, AlertTriangle, Hand, RefreshCw, ArrowDownUp, List } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import useSimulationStore, { useComputedSystemState } from '../store/useSimulationStore';
+import MiniRAG from './prevention/MiniRAG';
+import { ResourcePoolCounter, StepTimeline, ProcessStateChip, PreventionBanner } from './prevention/PreventionAnimations';
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PREVENTION PAGE — Real Protocol Execution Engine
+   Each protocol calls real Zustand store actions that mutate global state.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// Demo scenarios per protocol
+const DEMO_SCENARIOS = {
+  p1: { label: 'P1 requests R1,R2,R3 (all at once)', resources: [{ id:'R1', instances:2 },{ id:'R2', instances:1 },{ id:'R3', instances:1 }], processes: [{ id:'P1', max:{R1:1,R2:1,R3:1}, state:'running' },{ id:'P2', max:{R1:1,R2:1,R3:0}, state:'running' }], edges: [] },
+  p2: { label: 'P1 holds R1, requests R2', resources: [{ id:'R1', instances:1 },{ id:'R2', instances:1 },{ id:'R3', instances:1 }], processes: [{ id:'P1', max:{R1:1,R2:1,R3:1}, state:'running' },{ id:'P2', max:{R1:0,R2:0,R3:1}, state:'running' }], edges: [{ source:'R1', target:'P1', type:'assignment' }] },
+  p3: { label: 'P1 holds R1, requests unavailable R2', resources: [{ id:'R1', instances:1 },{ id:'R2', instances:1 }], processes: [{ id:'P1', max:{R1:1,R2:1}, state:'running' },{ id:'P2', max:{R1:0,R2:1}, state:'running' }], edges: [{ source:'R1', target:'P1', type:'assignment' },{ source:'R2', target:'P2', type:'assignment' }] },
+  p4: { label: 'P2 requests R1 held by blocked P1', resources: [{ id:'R1', instances:1 },{ id:'R2', instances:1 }], processes: [{ id:'P1', max:{R1:1,R2:1}, state:'blocked' },{ id:'P2', max:{R1:1,R2:0}, state:'running' }], edges: [{ source:'R1', target:'P1', type:'assignment' },{ source:'R2', target:'P2', type:'assignment' },{ source:'P1', target:'R2', type:'request' }] },
+};
 
 export default function Prevention() {
-  const prevention = useSimulationStore(s => s.prevention);
-  const togglePrevention = useSimulationStore(s => s.togglePrevention);
-  const [sandboxAction, setSandboxAction] = useState('holdAndWaitTest');
-  const [sandboxResult, setSandboxResult] = useState(null);
+  const processes = useSimulationStore(s => s.processes);
+  const resources = useSimulationStore(s => s.resources);
+  const edges = useSimulationStore(s => s.edges);
+  const timeline = useSimulationStore(s => s.timeline);
+  const injectState = useSimulationStore(s => s.injectState);
+  const execP1 = useSimulationStore(s => s.executeHoldAndWaitAllAtOnce);
+  const execP2 = useSimulationStore(s => s.executeHoldAndWaitReleaseFirst);
+  const execP3 = useSimulationStore(s => s.executeNoPreemptionForceRelease);
+  const execP4 = useSimulationStore(s => s.executeNoPreemptionFromBlocked);
+  const execCW = useSimulationStore(s => s.executeCircularWaitOrdering);
+  const computed = useComputedSystemState();
 
-  const runSandbox = () => {
-    if (sandboxAction === 'holdAndWaitTest') {
-      if (prevention.holdAndWait) setSandboxResult({ status: 'BLOCKED', msg: 'OS rejected request. Process P1 is already holding resources and must release them before requesting new ones.', icon: <Ban className="text-red-500" size={24}/>, color: 'text-red-400', bg: 'bg-red-900/20 border-red-800/50' });
-      else setSandboxResult({ status: 'ALLOWED', msg: 'OS allowed request. Process P1 granted resource while holding another (Deadlock Risk).', icon: <CheckCircle className="text-emerald-500" size={24}/>, color: 'text-emerald-400', bg: 'bg-emerald-900/20 border-emerald-800/50' });
-    } else if (sandboxAction === 'preemptionTest') {
-      if (prevention.noPreemption) setSandboxResult({ status: 'ALLOWED', msg: 'OS forcibly preempted resource from Process P2.', icon: <CheckCircle className="text-emerald-500" size={24}/>, color: 'text-emerald-400', bg: 'bg-emerald-900/20 border-emerald-800/50' });
-      else setSandboxResult({ status: 'BLOCKED', msg: 'OS rejected preemption. Process P2 cannot be forcibly stripped of its resources.', icon: <Ban className="text-red-500" size={24}/>, color: 'text-red-400', bg: 'bg-red-900/20 border-red-800/50' });
-    } else if (sandboxAction === 'circularWaitTest') {
-      if (prevention.circularWait) setSandboxResult({ status: 'BLOCKED', msg: 'OS rejected request. Process P3 requested Resource R1, but already holds higher-order Resource R3.', icon: <Ban className="text-red-500" size={24}/>, color: 'text-red-400', bg: 'bg-red-900/20 border-red-800/50' });
-      else setSandboxResult({ status: 'ALLOWED', msg: 'OS allowed request. Process P3 granted Resource R1, forming a potential circular wait.', icon: <CheckCircle className="text-emerald-500" size={24}/>, color: 'text-emerald-400', bg: 'bg-emerald-900/20 border-emerald-800/50' });
-    }
+  const [activeTab, setActiveTab] = useState('holdwait');
+  const [activeProtocol, setActiveProtocol] = useState(1);
+  const [selectedProcess, setSelectedProcess] = useState('');
+  const [selectedResources, setSelectedResources] = useState([]);
+  const [selectedResource, setSelectedResource] = useState('');
+  const [executionSteps, setExecutionSteps] = useState(null);
+  const [currentStep, setCurrentStep] = useState(-1);
+  const [isExecuting, setIsExecuting] = useState(false);
+
+  const prevTimeline = useMemo(() => timeline.filter(t => t.eventType === 'prevention').slice(-20).reverse(), [timeline]);
+
+  const loadDemo = (key) => {
+    const d = DEMO_SCENARIOS[key];
+    injectState({ resources: d.resources, processes: d.processes, edges: d.edges });
+    setExecutionSteps(null); setCurrentStep(-1); setIsExecuting(false);
+    setSelectedProcess(''); setSelectedResources([]); setSelectedResource('');
   };
 
-  const coffmanConditions = [
-    { id: 'mutualExclusion', title: 'Mutual Exclusion', desc: 'Resources cannot be shared. (Required for non-sharable resources like printers).', effect: 'If disabled, processes can simultaneously access the same resource.', enforceable: false },
-    { id: 'holdAndWait', title: 'Hold and Wait', desc: 'A process holding at least one resource is waiting to acquire additional resources held by other processes.', effect: 'If disabled, processes must request all required resources at once. In the RAG Builder, a process holding a resource will be denied from requesting another.', enforceable: true },
-    { id: 'noPreemption', title: 'No Preemption', desc: 'Resources cannot be forcibly taken from a process.', effect: 'If disabled, the OS can forcefully steal resources. In the Recovery Console, the Preemption tool becomes active.', enforceable: true },
-    { id: 'circularWait', title: 'Circular Wait', desc: 'A closed chain of processes exists, where each process holds at least one resource needed by the next process in the chain.', effect: 'If disabled, resources are ordered numerically. A process can only request resources of a higher order than what it currently holds.', enforceable: true }
+  const resetExecution = () => { setExecutionSteps(null); setCurrentStep(-1); setIsExecuting(false); };
+
+  const executeProtocol = useCallback(() => {
+    let result;
+    if (activeProtocol === 1 && selectedProcess && selectedResources.length > 0) {
+      result = execP1(selectedProcess, selectedResources);
+    } else if (activeProtocol === 2 && selectedProcess && selectedResources.length > 0) {
+      result = execP2(selectedProcess, selectedResources);
+    } else if (activeProtocol === 3 && selectedProcess && selectedResource) {
+      result = execP3(selectedProcess, selectedResource);
+    } else if (activeProtocol === 4 && selectedProcess && selectedResource) {
+      result = execP4(selectedProcess, selectedResource);
+    } else if (activeProtocol === 5 && selectedProcess && selectedResource) {
+      result = execCW(selectedProcess, selectedResource);
+    }
+    if (result?.steps) {
+      setExecutionSteps(result.steps);
+      setCurrentStep(0);
+      setIsExecuting(true);
+    }
+  }, [activeProtocol, selectedProcess, selectedResources, selectedResource, execP1, execP2, execP3, execP4, execCW]);
+
+  const nextStep = () => { if (executionSteps && currentStep < executionSteps.length - 1) setCurrentStep(c => c + 1); };
+  const prevStep = () => { if (currentStep > 0) setCurrentStep(c => c - 1); };
+
+  const tabs = [
+    { id: 'holdwait', label: 'Hold & Wait', icon: <Hand size={16}/>, protocols: [1,2] },
+    { id: 'nopreempt', label: 'No Preemption', icon: <Lock size={16}/>, protocols: [3,4] },
+    { id: 'circwait', label: 'Circular Wait', icon: <ArrowDownUp size={16}/>, protocols: [5] },
   ];
 
+  const protocolInfo = {
+    1: { title: 'Request All Resources At Once', subtitle: 'A process must request ALL resources before execution. All-or-nothing allocation.', color: 'violet', demoKey: 'p1' },
+    2: { title: 'Request Only When Holding None', subtitle: 'A process must release all held resources before requesting new ones.', color: 'violet', demoKey: 'p2' },
+    3: { title: 'Force Resource Release', subtitle: 'If a process requests an unavailable resource, all its held resources are forcibly released.', color: 'orange', demoKey: 'p3' },
+    4: { title: 'Preempt From Blocked Process', subtitle: 'If requested resource is held by a blocked process, preempt it and transfer ownership.', color: 'orange', demoKey: 'p4' },
+    5: { title: 'Resource Ordering', subtitle: 'Resources are ordered numerically. Processes may only request higher-ordered resources.', color: 'cyan', demoKey: null },
+  };
+
+  const pi = protocolInfo[activeProtocol];
+  const needsMultiSelect = activeProtocol <= 2;
+
+  const toggleResource = (rId) => {
+    setSelectedResources(prev => prev.includes(rId) ? prev.filter(r => r !== rId) : [...prev, rId]);
+  };
+
+  const canExecute = selectedProcess && (needsMultiSelect ? selectedResources.length > 0 : !!selectedResource);
+
   return (
-    <div className="h-full flex flex-col w-full max-w-[1600px] mx-auto py-8">
-      <div className="text-center mb-10 shrink-0">
-        <div className="inline-flex p-3 bg-blue-900/50 border border-blue-800 rounded-2xl mb-4"><Shield size={32} className="text-blue-400"/></div>
-        <h1 className="text-3xl font-bold text-slate-100 tracking-tight">Deadlock Prevention</h1>
-        <p className="text-slate-400 font-medium mt-2 max-w-xl mx-auto">Deadlock prevention works by ensuring that at least one of the four Coffman conditions cannot hold.</p>
-      </div>
-      <div className="bg-slate-900 border border-slate-800 rounded-xl shadow-sm p-8 flex-1 overflow-y-auto custom-scrollbar">
-        <div className="bg-blue-900/30 border border-blue-800/50 p-4 rounded-lg mb-8 text-blue-300 text-sm">
-          <strong>Interactive Rules Engine:</strong> Toggling the switches below will physically alter the behavior of the Operating System Simulator. If you disable a condition, the RAG Builder and Recovery Console will actively enforce that rule.
+    <div className="h-full flex flex-col w-full max-w-[1600px] mx-auto">
+      {/* Header & Tabs */}
+      <div className="bg-slate-900 border-b border-slate-800 px-6 pt-6 shrink-0 shadow-sm rounded-t-xl">
+        <div className="flex items-center gap-3 mb-6">
+          <div className="p-2 bg-violet-900/50 rounded-lg border border-violet-800"><Shield className="text-violet-400" size={24}/></div>
+          <div>
+            <h2 className="text-2xl font-bold tracking-tight text-slate-100">Deadlock Prevention</h2>
+            <p className="text-sm font-medium text-slate-400">Real-time protocol enforcement engine — protocols modify live system state</p>
+          </div>
         </div>
-        <div className="space-y-6">
-          {coffmanConditions.map((cond) => {
-            const isActive = prevention[cond.id];
-            return (
-              <div key={cond.id} className={`p-6 border rounded-xl transition-all ${isActive ? 'bg-red-900/10 border-red-800/50' : 'bg-slate-950 border-slate-800 hover:border-blue-500/50'}`}>
-                <div className="flex items-start justify-between">
-                  <div className="flex-1 pr-8">
-                    <div className="flex items-center gap-3 mb-2">
-                      {isActive ? <Ban size={20} className="text-red-400"/> : <Lock size={20} className="text-emerald-400"/>}
-                      <h3 className={`text-lg font-bold ${isActive ? 'text-red-400' : 'text-slate-200'}`}>{cond.title}</h3>
-                      {isActive && <span className="px-2 py-0.5 text-xs font-bold bg-red-900/30 text-red-400 rounded border border-red-800/50">CONDITION ACTIVE</span>}
-                      {!isActive && <span className="px-2 py-0.5 text-xs font-bold bg-emerald-900/30 text-emerald-400 rounded border border-emerald-800/50">PREVENTED</span>}
+        <div className="flex gap-4">
+          {tabs.map(tab => (
+            <button key={tab.id} onClick={() => { setActiveTab(tab.id); setActiveProtocol(tab.protocols[0]); resetExecution(); }}
+              className={`pb-3 text-sm font-bold uppercase tracking-wider flex items-center gap-2 transition-all relative ${activeTab === tab.id ? 'text-violet-400' : 'text-slate-500 hover:text-slate-300'}`}>
+              {tab.icon} {tab.label}
+              {activeTab === tab.id && <motion.div layoutId="prevTab" className="absolute bottom-0 left-0 right-0 h-1 bg-violet-500 rounded-t" />}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 bg-slate-900 border border-t-0 border-slate-800 rounded-b-xl overflow-y-auto custom-scrollbar">
+        <div className="p-6 space-y-5">
+
+          {/* Protocol Selector (for tabs with 2 protocols) */}
+          {tabs.find(t => t.id === activeTab)?.protocols.length > 1 && (
+            <div className="flex gap-3">
+              {tabs.find(t => t.id === activeTab).protocols.map(pNum => (
+                <button key={pNum} onClick={() => { setActiveProtocol(pNum); resetExecution(); }}
+                  className={`flex-1 p-4 rounded-xl border text-left transition-all ${activeProtocol === pNum
+                    ? 'bg-slate-800 border-violet-700/50 shadow-md' : 'bg-slate-950 border-slate-800 hover:border-slate-600'}`}>
+                  <span className={`text-[10px] font-black px-2 py-0.5 rounded border ${activeProtocol === pNum
+                    ? 'bg-violet-900/40 border-violet-700/50 text-violet-400' : 'bg-slate-800 border-slate-700 text-slate-500'}`}>P{pNum}</span>
+                  <h4 className={`text-sm font-bold mt-2 ${activeProtocol === pNum ? 'text-slate-100' : 'text-slate-400'}`}>{protocolInfo[pNum].title}</h4>
+                  <p className="text-xs text-slate-500 mt-1">{protocolInfo[pNum].subtitle}</p>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Main Layout: Control Panel + RAG */}
+          <div className="grid lg:grid-cols-5 gap-5">
+
+            {/* Left: Protocol Execution Panel */}
+            <div className="lg:col-span-3 space-y-4">
+
+              {/* Protocol Header */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+                <div className="flex items-center gap-3 mb-3">
+                  <span className={`text-[10px] font-black px-2 py-0.5 rounded border ${
+                    pi.color === 'violet' ? 'bg-violet-900/40 border-violet-700/50 text-violet-400' :
+                    pi.color === 'orange' ? 'bg-orange-900/40 border-orange-700/50 text-orange-400' :
+                    'bg-cyan-900/40 border-cyan-700/50 text-cyan-400'}`}>PROTOCOL {activeProtocol}</span>
+                  <h3 className="text-lg font-bold text-slate-100">{pi.title}</h3>
+                </div>
+                <p className="text-sm text-slate-400">{pi.subtitle}</p>
+                {pi.demoKey && (
+                  <button onClick={() => loadDemo(pi.demoKey)}
+                    className="mt-3 text-xs font-bold text-violet-400 hover:text-violet-300 flex items-center gap-1 transition-colors">
+                    <Zap size={12}/> Load Demo Scenario
+                  </button>
+                )}
+              </div>
+
+              {/* Scenario Config */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-4">
+                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Configure Request</h4>
+
+                {/* Process Selection */}
+                <div>
+                  <label className="text-xs text-slate-500 font-bold mb-1 block">Requesting Process</label>
+                  <select value={selectedProcess} onChange={e => setSelectedProcess(e.target.value)}
+                    className="w-full bg-slate-900 border border-slate-700 text-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500 text-sm">
+                    <option value="">Select Process...</option>
+                    {processes.map(p => (
+                      <option key={p.id} value={p.id}>{p.id} ({p.state})</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Resource Selection */}
+                {needsMultiSelect ? (
+                  <div>
+                    <label className="text-xs text-slate-500 font-bold mb-2 block">Requested Resources (select multiple)</label>
+                    <div className="flex flex-wrap gap-2">
+                      {resources.map(r => {
+                        const allocated = edges.filter(e => e.type === 'assignment' && e.source === r.id).length;
+                        const avail = r.instances - allocated;
+                        const sel = selectedResources.includes(r.id);
+                        return (
+                          <button key={r.id} onClick={() => toggleResource(r.id)}
+                            className={`px-3 py-2 rounded-lg border text-sm font-bold transition-all ${sel
+                              ? 'bg-violet-900/40 border-violet-600 text-violet-300'
+                              : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500'}`}>
+                            {r.id} <span className={`text-xs ml-1 ${avail > 0 ? 'text-emerald-500' : 'text-red-500'}`}>({avail}/{r.instances})</span>
+                          </button>
+                        );
+                      })}
                     </div>
-                    <p className="text-slate-400 text-sm mb-4 leading-relaxed">{cond.desc}</p>
-                    <div className="bg-slate-900 border border-slate-800 p-3 rounded text-sm text-slate-300 flex gap-3"><Activity size={18} className="text-blue-500 shrink-0"/><p><strong>Simulation Effect:</strong> {cond.effect}</p></div>
+                    {selectedResources.length > 0 && (
+                      <div className="mt-2 text-xs text-slate-400">Selected: <span className="text-violet-400 font-bold">{selectedResources.join(', ')}</span></div>
+                    )}
                   </div>
-                  <div className="shrink-0 flex flex-col items-end gap-2">
-                    {cond.enforceable ? (
-                      <button onClick={() => togglePrevention(cond.id)} className={`relative inline-flex h-7 w-14 items-center rounded-full transition-colors focus:outline-none ${isActive ? 'bg-red-500' : 'bg-emerald-500'}`}>
-                        <span className={`inline-block h-5 w-5 transform rounded-full bg-slate-950 transition-transform ${isActive ? 'translate-x-8' : 'translate-x-1'}`}/>
-                      </button>
-                    ) : (<div className="text-xs text-slate-500 font-bold bg-slate-800 px-3 py-1.5 rounded">HARDWARE BOUND</div>)}
-                    <span className="text-xs font-bold text-slate-500 uppercase">{isActive ? 'Allowed' : 'Disabled'}</span>
+                ) : (
+                  <div>
+                    <label className="text-xs text-slate-500 font-bold mb-1 block">Requested Resource</label>
+                    <select value={selectedResource} onChange={e => setSelectedResource(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-700 text-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500 text-sm">
+                      <option value="">Select Resource...</option>
+                      {resources.map(r => {
+                        const allocated = edges.filter(e => e.type === 'assignment' && e.source === r.id).length;
+                        return <option key={r.id} value={r.id}>{r.id} ({r.instances - allocated}/{r.instances} free)</option>;
+                      })}
+                    </select>
                   </div>
+                )}
+
+                {/* Current Holdings Display */}
+                {selectedProcess && (
+                  <div className="bg-slate-900 border border-slate-800 rounded-lg p-3">
+                    <div className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mb-2">Current Holdings: {selectedProcess}</div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <ProcessStateChip state={processes.find(p => p.id === selectedProcess)?.state || 'idle'} size="sm" />
+                      {edges.filter(e => e.type === 'assignment' && e.target === selectedProcess).map((e, i) => (
+                        <span key={i} className="bg-emerald-900/30 border border-emerald-800/50 text-emerald-400 px-2 py-0.5 rounded text-xs font-bold">{e.source}</span>
+                      ))}
+                      {edges.filter(e => e.type === 'assignment' && e.target === selectedProcess).length === 0 && (
+                        <span className="text-xs text-slate-600">No resources held</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Execute Button */}
+                <div className="flex gap-3">
+                  <button onClick={executeProtocol} disabled={!canExecute}
+                    className={`flex-1 py-3 px-4 rounded-lg font-bold text-sm transition-all flex items-center justify-center gap-2 text-white shadow-sm ${
+                      canExecute ? 'bg-violet-600 hover:bg-violet-500' : 'bg-violet-900/30 text-violet-600 cursor-not-allowed'}`}>
+                    <Play size={16}/> Execute Protocol {activeProtocol}
+                  </button>
+                  {executionSteps && (
+                    <button onClick={resetExecution} className="p-3 rounded-lg border border-slate-700 text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-all">
+                      <RotateCcw size={16}/>
+                    </button>
+                  )}
                 </div>
               </div>
-            );
-          })}
-        </div>
 
-        {/* Prevention Sandbox */}
-        <div className="mt-12 bg-slate-950 border border-slate-800 rounded-xl p-8 shadow-sm">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="p-2 bg-blue-900/30 rounded-lg border border-blue-800"><Cpu className="text-blue-400" size={20}/></div>
-            <div><h3 className="text-xl font-bold text-slate-100">Prevention Policy Sandbox</h3><p className="text-sm text-slate-400">Simulate OS behavior under current active rules.</p></div>
-          </div>
-          <div className="flex flex-col md:flex-row gap-6">
-            <div className="flex-1 space-y-4">
-              <select className="w-full bg-slate-900 border border-slate-700 text-slate-200 rounded-lg p-3 outline-none focus:border-blue-500 transition-colors" value={sandboxAction} onChange={(e) => { setSandboxAction(e.target.value); setSandboxResult(null); }}>
-                <option value="holdAndWaitTest">Simulate: P1 requests R2 while holding R1</option>
-                <option value="preemptionTest">Simulate: OS attempts to preempt R1 from P2</option>
-                <option value="circularWaitTest">Simulate: P3 requests R1 while holding R3</option>
-              </select>
-              <button onClick={runSandbox} className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-6 rounded-lg transition-all flex items-center justify-center gap-2 shadow-md">Test Action Against Policies <Play size={18}/></button>
+              {/* Execution Steps */}
+              <AnimatePresence>
+                {executionSteps && (
+                  <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+                    className="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Execution Trace</h4>
+                      <div className="flex items-center gap-2">
+                        <button onClick={prevStep} disabled={currentStep <= 0}
+                          className="p-1.5 rounded border border-slate-700 text-slate-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed"><ChevronLeft size={14}/></button>
+                        <span className="text-xs text-slate-500 font-bold">{currentStep + 1}/{executionSteps.length}</span>
+                        <button onClick={nextStep} disabled={currentStep >= executionSteps.length - 1}
+                          className="p-1.5 rounded border border-slate-700 text-slate-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed"><ChevronRight size={14}/></button>
+                      </div>
+                    </div>
+                    <StepTimeline steps={executionSteps} currentStep={currentStep} onStepClick={setCurrentStep} />
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
-            <div className="flex-1 flex flex-col justify-center">
-              {sandboxResult ? (
-                <div className={`p-6 rounded-xl border flex gap-4 items-start transition-all ${sandboxResult.bg}`}>
-                  <div className="shrink-0 mt-1">{sandboxResult.icon}</div>
-                  <div><h4 className={`font-bold tracking-wider mb-2 ${sandboxResult.color}`}>{sandboxResult.status}</h4><p className="text-slate-300 text-sm leading-relaxed">{sandboxResult.msg}</p></div>
+
+            {/* Right: Live System View */}
+            <div className="lg:col-span-2 space-y-4">
+              <MiniRAG height={260} />
+
+              {/* Resource Availability */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+                <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3">Resource Availability</h4>
+                <ResourcePoolCounter resources={resources} edges={edges} />
+              </div>
+
+              {/* Process States */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+                <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3">Process States</h4>
+                <div className="space-y-2">
+                  {processes.map(p => (
+                    <div key={p.id} className="flex items-center justify-between bg-slate-900 border border-slate-800 rounded-lg px-3 py-2">
+                      <span className="text-sm font-bold text-slate-300">{p.id}</span>
+                      <div className="flex items-center gap-2">
+                        {edges.filter(e => e.type === 'assignment' && e.target === p.id).map((e, i) => (
+                          <span key={i} className="text-[10px] bg-emerald-900/30 text-emerald-400 px-1.5 py-0.5 rounded font-bold">{e.source}</span>
+                        ))}
+                        <ProcessStateChip state={p.state} size="sm" />
+                      </div>
+                    </div>
+                  ))}
+                  {processes.length === 0 && <p className="text-xs text-slate-600 text-center py-4">Load a demo scenario</p>}
                 </div>
-              ) : (
-                <div className="h-full min-h-[100px] border-2 border-dashed border-slate-800 rounded-xl flex items-center justify-center text-slate-500 text-sm p-6 text-center">Select a scenario and click Test Action to see how the current OS policies handle it.</div>
-              )}
+              </div>
+
+              {/* Prevention Timeline */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 max-h-[200px] overflow-y-auto custom-scrollbar">
+                <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-1.5"><List size={12}/> Prevention Log</h4>
+                {prevTimeline.length === 0 ? (
+                  <p className="text-xs text-slate-600 text-center py-3">Execute a protocol to see events</p>
+                ) : prevTimeline.map(ev => (
+                  <div key={ev.id} className="flex gap-2 text-xs py-1.5 border-b border-slate-800/50 last:border-0">
+                    <span className="text-slate-600 font-mono shrink-0 w-14">{ev.timeLabel}</span>
+                    <span className="text-violet-400 font-medium">{ev.description}</span>
+                  </div>
+                ))}
+              </div>
             </div>
+          </div>
+
+          {/* Protocol Explanation Cards */}
+          <div className="bg-slate-950 border border-slate-800 rounded-xl p-5">
+            <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-4">Protocol {activeProtocol} — How It Prevents Deadlock</h4>
+            {activeProtocol === 1 && <PreventionBanner type="prevention" message="Hold and Wait condition eliminated — process must request ALL resources at once. Either gets everything or gets nothing. Partial allocation never occurs." />}
+            {activeProtocol === 2 && <PreventionBanner type="prevention" message="Hold and Wait condition eliminated — process cannot request resources while holding others. Must release everything first, then re-request all needed resources together." />}
+            {activeProtocol === 3 && <PreventionBanner type="preempted" message="No Preemption condition eliminated — if a process requests an unavailable resource while holding others, the OS forcibly releases all held resources and moves the process to WAITING." />}
+            {activeProtocol === 4 && <PreventionBanner type="preempted" message="No Preemption condition eliminated — if the requested resource is held by a blocked/waiting process, the OS preempts it and transfers ownership to the requester." />}
+            {activeProtocol === 5 && <PreventionBanner type="prevention" message="Circular Wait condition eliminated — resources are ordered (R1 < R2 < R3...). A process may only request resources with a higher order than its highest held resource." />}
           </div>
         </div>
       </div>
