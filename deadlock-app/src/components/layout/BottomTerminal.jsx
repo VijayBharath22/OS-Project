@@ -1,10 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Terminal as TerminalIcon, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useSystem } from '../../context/SystemContext';
+import useSimulationStore from '../../store/useSimulationStore';
 
 export default function BottomTerminal() {
-  const { state } = useSystem();
+  const logs = useSimulationStore((state) => state.logs);
   const [isExpanded, setIsExpanded] = useState(false);
   const logsEndRef = useRef(null);
 
@@ -12,7 +12,7 @@ export default function BottomTerminal() {
     if (logsEndRef.current) {
        logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [state.logs, isExpanded]);
+  }, [logs, isExpanded]);
 
   return (
     <div className={`bg-[#0d1117] border-t border-slate-800 flex flex-col shrink-0 transition-all duration-300 z-30 ${isExpanded ? 'h-64' : 'h-8'}`}>
@@ -24,7 +24,7 @@ export default function BottomTerminal() {
              <TerminalIcon size={14}/> SYSTEM_EVENT_LOG
           </div>
           <div className="flex items-center gap-2 text-slate-500">
-             {state.logs.length > 0 && <span className="text-[10px] bg-slate-800 px-2 rounded-full">{state.logs.length} EVENTS</span>}
+             {logs.length > 0 && <span className="text-[10px] bg-slate-800 px-2 rounded-full">{logs.length} EVENTS</span>}
              {isExpanded ? <ChevronDown size={14}/> : <ChevronUp size={14}/>}
           </div>
        </div>
@@ -37,7 +37,7 @@ export default function BottomTerminal() {
                exit={{ opacity: 0 }}
                className="flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1.5 custom-scrollbar"
             >
-               {state.logs.map((log) => (
+               {logs.map((log) => (
                  <div key={log.id} className={`flex ${log.type === 'error' ? 'text-red-400' : log.type === 'warning' ? 'text-yellow-400' : 'text-cyan-200 opacity-90'}`}>
                    <span className="text-slate-600 mr-3 shrink-0">[{log.time}]</span>
                    <span className="break-words">{log.msg}</span>
